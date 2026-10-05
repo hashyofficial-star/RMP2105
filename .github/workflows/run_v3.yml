@@ -1,0 +1,80 @@
+name: resign_v3
+
+on:
+  workflow_dispatch:
+    inputs:
+      ZIP_URL:    
+        description: 'URL of (splloader)+uboot+sml+trustos+(teecfg)+vbmeta+boot+(recovery) (all end with .bin)'
+        required: true
+        default: ''
+      EXTRA_KEY_TREE_URL:
+        description: 'EXTRA_KEY_TREE_URL (leave blank if you only use unisoc keys)'
+        required: false
+      EXTRA_KEY_BRANCH:
+        description: 'EXTRA_KEY_BRANCH (leave blank if you only use unisoc keys)'
+        required: false
+      antiroll:
+        description: 'anti-rollback version (trusted_version) for BSP signing'
+        required: false
+        default: '0'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        ref: main
+        path: main
+
+    - name: Setup SSH Keys
+      if: ${{ startsWith(github.event.inputs.EXTRA_KEY_TREE_URL, 'git@github.com') }}
+      uses: webfactory/ssh-agent@v0.10.0
+      with:
+          ssh-private-key: |
+            ${{ secrets.SSH_PRIVATE_KEY }}
+
+    - name: Clone extra keys
+      if: |
+        github.event.inputs.EXTRA_KEY_TREE_URL != null
+        && github.event.inputs.EXTRA_KEY_BRANCH != null
+      run: |
+        git clone ${{ github.event.inputs.EXTRA_KEY_TREE_URL }} -b ${{ github.event.inputs.EXTRA_KEY_BRANCH }} ./extra_key
+
+    - name: patch
+      env:
+        ANTIROLL: "${{ github.event.inputs.antiroll }}"
+      run: |
+        sudo apt update
+        sudo apt -y install build-essential openssl curl wget busybox xz-utils python3
+        # install static 7zz used by the scripts instead of busybox unzip:
+        # latest official ip7z/7zip linux-x64 release (resolved via GitHub API),
+        # falling back to the mcmilk/7-Zip-zstd nightly linux-clang-x64 build
+        chmod +x main/setup-7zz.sh
+        ./main/setup-7zz.sh
+        # build avbctl, the static C replacement for the python2 avbtool
+        # (fetches mbedtls-3.6 and links it statically)
+        make -C main/avbctl
+        curl -o original.zip -L "${{ github.event.inputs.ZIP_URL }}"
+        curl -o magisk.apk -L $(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases | grep -Po -m 1 '(?<=download_url\"\: \").*Magisk.*Magisk.*apk')
+        wget https://raw.githubusercontent.com/magojohnji/magiskboot-linux/main/x86_64/magiskboot
+        chmod +x magiskboot
+        chmod +x main/*.sh
+        mv main/sign_v3.sh ./
+        if ! [[ "$ANTIROLL" =~ ^[0-9]+$ ]]; then echo "antiroll must be a non-negative integer"; exit 1; fi
+        sed -i "s/trusted_version=.*/trusted_version=$ANTIROLL/" main/config/version.cfg
+        ./sign_v3.sh
+
+    - name: Upload to Release
+      uses: softprops/action-gh-release@v3
+      with:
+        files: | 
+          resigned.zip
+        name: ${{ github.run_id }}
+        tag_name: ${{ github.run_id }}
+        body: |
+          URL: ${{ github.event.inputs.ZIP_URL }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
